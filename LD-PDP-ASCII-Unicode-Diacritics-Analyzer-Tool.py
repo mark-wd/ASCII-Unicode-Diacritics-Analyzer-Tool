@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASCII-Unicode Diacritics Analyzer Tool (v1.0a)
+ASCII-Unicode Diacritics Analyzer Tool (v1.1)
 On behalf of the ICANN Latin Script Diacritics Policy Development Process WG (LD-WG)
 
 For inquiries about the code, contact the maintainer:
@@ -221,6 +221,68 @@ def analyze_characters(conn):
     conn.commit()
     return (one_diacritic_results, two_diacritics_results)
 
+def process_other_latin_lgr_occurrences():
+    """
+    Process specific Unicode patterns for the "Other occurrences in the Latin RZ LGR" table.
+    
+    Returns:
+        list: List of tuples containing (combined_char, base_char, diacritic, detailed_decomp)
+    """
+    # List of Unicode patterns to process
+    patterns = [
+        "U+0061 U+0331",  # a + combining macron below
+        "U+0065 U+0331",  # e + combining macron below
+        "U+0067 U+0303",  # g + combining tilde
+        "U+0069 U+0331",  # i + combining macron below
+        "U+006D U+0327",  # m + combining cedilla
+        "U+006E U+0304",  # n + combining macron
+        "U+006E U+0308",  # n + combining diaeresis
+        "U+006F U+0327",  # o + combining cedilla
+        "U+006F U+0331",  # o + combining macron below
+        "U+0072 U+0303",  # r + combining tilde
+        "U+1EB9 U+0300",  # e with dot below + combining grave accent
+        "U+1EB9 U+0301",  # e with dot below + combining acute accent
+        "U+1ECD U+0300",  # o with dot below + combining grave accent
+        "U+1ECD U+0301",  # o with dot below + combining acute accent
+    ]
+    
+    results = []
+    
+    for pattern in patterns:
+        # Split the pattern into code points
+        code_points = pattern.split()
+        
+        # Convert code points to characters
+        chars = [chr(int(cp[2:], 16)) for cp in code_points]
+        
+        # Combine the characters
+        combined_char = ''.join(chars)
+        
+        # Get the base character and diacritic
+        base_char = chars[0]
+        diacritic = chars[1]
+        
+        # Create detailed decomposition with names and code points
+        detailed_decomp_parts = []
+        for c in chars:
+            char_name = unicodedata.name(c, 'UNKNOWN')
+            code_point = f"U+{ord(c):04X}"
+            
+            # Add extra spacing around combining characters
+            if unicodedata.category(c).startswith('M'):
+                formatted_char = f"&nbsp;{c}&nbsp;"
+            else:
+                formatted_char = c
+            
+            detailed_decomp_parts.append(f"{formatted_char} ({char_name}, {code_point})")
+        
+        # Use HTML formatting for better spacing
+        detailed_decomp = ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
+        
+        results.append((combined_char, base_char, diacritic, detailed_decomp))
+    
+    return results
+
 def setup_fonts():
     """
     Set up fonts for PDF generation. Downloads Noto Sans for optimal Unicode support, with Arial as a reliable fallback for all platforms.
@@ -287,6 +349,9 @@ def generate_pdf_report(results_tuple, output_filename):
         output_filename (str): Name of the output PDF file
     """
     one_diacritic_results, two_diacritics_results = results_tuple
+    
+    # Process other Latin LGR occurrences
+    other_lgr_occurrences = process_other_latin_lgr_occurrences()
     
     print(f"Generating PDF report to {output_filename}...")
     print(f"Found {len(one_diacritic_results)} characters with one diacritic")
@@ -453,6 +518,58 @@ def generate_pdf_report(results_tuple, output_filename):
         content.append(table2)
     else:
         content.append(Paragraph("No characters with two or more diacritic marks were found.", custom_style))
+    
+    # Add space between tables
+    content.append(Spacer(1, 30))
+    
+    # ===== TABLE 3: Other occurrences in the Latin RZ LGR =====
+    content.append(Paragraph(f"Other occurrences in the Latin RZ LGR ({len(other_lgr_occurrences)})", heading2_style))
+    
+    # Create table data for other LGR occurrences
+    table3_data = [["Character", "Base", "Diacritic", "Technical Details"]]  # Header row
+    
+    # Process each result into paragraphs
+    for char, base_char, diacritic, detailed_decomp in other_lgr_occurrences:
+        # For the character column, show both the character and its code point
+        # We need to calculate the code point of the combined character
+        combined_code_points = [f"U+{ord(c):04X}" for c in char]
+        combined_code_point_str = " ".join(combined_code_points)
+        
+        char_cell = Paragraph(f"<para align='center'><font face='{main_font}' size='16'>{char}</font><br/><font size='8'>{combined_code_point_str}</font></para>", custom_style)
+        
+        base_cell = Paragraph(f"<para align='center'><font face='{main_font}' size='14'>{base_char}</font></para>", simple_decomp_style)
+        
+        diacritic_cell = Paragraph(f"<para align='center'><font face='{main_font}' size='14'>{diacritic}</font></para>", simple_decomp_style)
+        
+        detailed_decomp_cell = Paragraph(f"<font face='{main_font}'>{detailed_decomp}</font>", detailed_decomp_style)
+        
+        table3_data.append([char_cell, base_cell, diacritic_cell, detailed_decomp_cell])
+    
+    # Create table with four columns
+    table3 = Table(table3_data, colWidths=[80, 70, 70, 310])
+    
+    # Style the table
+    table3_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#32CCCC')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),  # Center align header text
+        ('ALIGN', (0, 1), (-1, -1), 'LEFT'),   # Left align content text
+        ('FONTNAME', (0, 0), (-1, 0), bold_font),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+    ])
+    
+    # Add alternating row colors
+    for i in range(1, len(table3_data)):
+        if i % 2 == 0:
+            table3_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
+    
+    table3.setStyle(table3_style)
+    content.append(table3)
     
     # Build PDF
     doc.build(content)
