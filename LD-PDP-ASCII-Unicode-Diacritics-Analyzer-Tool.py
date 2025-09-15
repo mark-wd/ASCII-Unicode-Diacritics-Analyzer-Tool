@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
-ASCII-Unicode Diacritics Analyzer Tool (v1.1)
+ASCII-Unicode Diacritics Analyzer Tool (v1.2)
 On behalf of the ICANN Latin Script Diacritics Policy Development Process WG (LD-WG)
 
-For inquiries about the code, contact the maintainer:
+For inquiries about the code, contact:
 Mark W. Datysgeld (mark@governanceprimer.com)
 
-This utility implements Unicode normalization (NFD) to analyze Latin script code points
-from ICANN's Label Generation Rules. It identifies characters that canonically decompose
-to ASCII base characters plus combining diacritical marks (Unicode General Category M).
-Results are categorized by diacritic count and output to a structured PDF report with
-complete Unicode technical data. The implementation uses in-memory SQLite storage and
-leaves no temporary files behind.
+This utility implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's Label Generation Rules. It identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to a structured PDF report with complete Unicode technical data. The implementation uses in-memory SQLite storage and leaves no temporary files behind.
 """
 
 """
@@ -43,70 +38,31 @@ For more information, please refer to <https://unlicense.org>
 """
 
 import os
-import re
 import sqlite3
 import unicodedata
 import requests
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 import tempfile
 import urllib.request
 import datetime
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus.doctemplate import BaseDocTemplate, PageTemplate
 from reportlab.platypus.frames import Frame
-from reportlab.lib.colors import blue, black
-from io import BytesIO
+from reportlab.lib.colors import black
 
 # Constants
-URL = "https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html"
+XML_URL = "https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.xml"
 # Generate filename with current date in YYYY-MM-DD format
 current_date = datetime.date.today().strftime("%Y-%m-%d")
 PDF_OUTPUT = f"LD-PDP-ASCII-Unicode-Diacritics-Report-{current_date}.pdf"
 ASCII_LETTERS = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
 
 
-def fetch_data_from_url(url):
-    # Fetch HTML data from ICANN's "Root Zone Label Generation Rules for the Latin Script" from 2022-05-26 and parses it to extract character data. Returns a list.
-    print(f"Fetching data from {url}...")
-    response = requests.get(url)
-    response.raise_for_status()  # Raise exception for HTTP errors
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # Extract characters from the table
-    characters = []
-    # Look for tables that might contain character data
-    tables = soup.find_all('table')
-    for table in tables:
-        rows = table.find_all('tr')
-        for row in rows:
-            cells = row.find_all('td')
-            if cells:
-                # Look for cells that might contain Unicode characters
-                for cell in cells:
-                    # Extract text and look for potential Unicode characters
-                    text = cell.get_text().strip()
-                    # Filter out obvious non-character cells
-                    if len(text) <= 2:  # Most Unicode characters are 1-2 chars long
-                        for char in text:
-                            if ord(char) > 127:  # Non-ASCII characters
-                                characters.append(char)
-    
-    # Remove duplicates while preserving order
-    unique_chars = []
-    seen = set()
-    for char in characters:
-        if char not in seen:
-            seen.add(char)
-            unique_chars.append(char)
-    
-    print(f"Found {len(unique_chars)} unique characters")
-    return unique_chars
 
 def setup_temp_database():
 
@@ -221,67 +177,139 @@ def analyze_characters(conn):
     conn.commit()
     return (one_diacritic_results, two_diacritics_results)
 
-def process_other_latin_lgr_occurrences():
+
+# ===== NEW: XML parsing and classification helpers =====
+def parse_lgr_xml(url):
     """
-    Process specific Unicode patterns for the "Other occurrences in the Latin RZ LGR" table.
-    
-    Returns:
-        list: List of tuples containing (combined_char, base_char, diacritic, detailed_decomp)
+    Parse the normative Latin RZ-LGR XML and return:
+      - latin_points: list[int] of single code points in the repertoire
+      - latin_sequences: list[list[int]] of repertoire sequences
     """
-    # List of Unicode patterns to process
-    patterns = [
-        "U+0061 U+0331",  # a + combining macron below
-        "U+0065 U+0331",  # e + combining macron below
-        "U+0067 U+0303",  # g + combining tilde
-        "U+0069 U+0331",  # i + combining macron below
-        "U+006D U+0327",  # m + combining cedilla
-        "U+006E U+0304",  # n + combining macron
-        "U+006E U+0308",  # n + combining diaeresis
-        "U+006F U+0327",  # o + combining cedilla
-        "U+006F U+0331",  # o + combining macron below
-        "U+0072 U+0303",  # r + combining tilde
-        "U+1EB9 U+0300",  # e with dot below + combining grave accent
-        "U+1EB9 U+0301",  # e with dot below + combining acute accent
-        "U+1ECD U+0300",  # o with dot below + combining grave accent
-        "U+1ECD U+0301",  # o with dot below + combining acute accent
-    ]
-    
+    resp = requests.get(url)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    # Find data element (namespace-agnostic; contains <char> items)
+    data_elem = None
+    for elem in root.iter():
+        if elem.tag.endswith('data'):
+            data_elem = elem
+            break
+
+    latin_points = []
+    latin_sequences = []
+    if data_elem is None:
+        return (latin_points, latin_sequences)
+
+    for ch in data_elem:
+        if not ch.tag.endswith('char'):
+            continue
+
+        # Filter non-Latin single code points by tag attribute (e.g., tag="sc:Grek").
+        # Sequences often omit 'tag'; we collect them and filter later by ASCII-base logic.
+        tag_attr = ch.get('tag')
+        if tag_attr and 'sc:Latn' not in tag_attr:
+            continue
+
+        # Handle ranges, if any
+        first_cp = ch.get('first-cp')
+        last_cp = ch.get('last-cp')
+        if first_cp and last_cp:
+            start = int(first_cp, 16)
+            end = int(last_cp, 16)
+            for code in range(start, end + 1):
+                latin_points.append(code)
+            continue
+
+        # Handle single or sequence
+        cp_attr = ch.get('cp') or ch.get('cps')
+        if not cp_attr:
+            continue
+        parts = cp_attr.strip().split()
+        codes = [int(p, 16) for p in parts]
+        if len(codes) == 1:
+            latin_points.append(codes[0])
+        else:
+            latin_sequences.append(codes)
+
+    # Deduplicate while preserving order
+    seen = set()
+    uniq_points = []
+    for cp in latin_points:
+        if cp not in seen:
+            seen.add(cp)
+            uniq_points.append(cp)
+
+    seen_seq = set()
+    uniq_sequences = []
+    for seq in latin_sequences:
+        t = tuple(seq)
+        if t not in seen_seq:
+            seen_seq.add(t)
+            uniq_sequences.append(seq)
+
+    return (uniq_points, uniq_sequences)
+
+
+def classify_sequences_ascii_base(latin_sequences):
+    """
+    From repertoire sequences, keep only those that start with an ASCII base letter
+    followed by one or more combining marks in NFD.
+    Returns list of tuples:
+      (combined_char, base_char, diacritics, detailed_decomp)
+    """
     results = []
-    
-    for pattern in patterns:
-        # Split the pattern into code points
-        code_points = pattern.split()
-        
-        # Convert code points to characters
-        chars = [chr(int(cp[2:], 16)) for cp in code_points]
-        
-        # Combine the characters
-        combined_char = ''.join(chars)
-        
-        # Get the base character and diacritic
-        base_char = chars[0]
-        diacritic = chars[1]
-        
-        # Create detailed decomposition with names and code points
+    for codes in latin_sequences:
+        chars = [chr(cp) for cp in codes]
+        combined = ''.join(chars)
+        nfd = unicodedata.normalize('NFD', combined)
+        if not nfd:
+            continue
+        base = nfd[0]
+        if base not in ASCII_LETTERS:
+            continue
+        diacritics = ''.join(c for c in nfd[1:] if unicodedata.category(c).startswith('M'))
+        if not diacritics:
+            continue
+
+        # Detailed decomposition built from the original code points in the sequence
         detailed_decomp_parts = []
         for c in chars:
-            char_name = unicodedata.name(c, 'UNKNOWN')
+            name = unicodedata.name(c, 'UNKNOWN')
             code_point = f"U+{ord(c):04X}"
-            
-            # Add extra spacing around combining characters
             if unicodedata.category(c).startswith('M'):
                 formatted_char = f"&nbsp;{c}&nbsp;"
             else:
                 formatted_char = c
-            
-            detailed_decomp_parts.append(f"{formatted_char} ({char_name}, {code_point})")
-        
-        # Use HTML formatting for better spacing
+            detailed_decomp_parts.append(f"{formatted_char} ({name}, {code_point})")
         detailed_decomp = ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
-        
-        results.append((combined_char, base_char, diacritic, detailed_decomp))
-    
+        results.append((combined, base, diacritics, detailed_decomp))
     return results
+
+
+def get_out_of_scope_from_db(conn):
+    """
+    Read characters stored in DB and return:
+      - out_of_scope_index: list of tuples (char, U+XXXX, NAME) where has_ascii_base = 0
+      - counts: dict with total_points, in_scope, out_of_scope
+    """
+    cursor = conn.cursor()
+    cursor.execute('SELECT character, name FROM characters WHERE is_latin = 1 AND has_ascii_base = 0')
+    rows = cursor.fetchall()
+    out = []
+    for ch, name in rows:
+        # Exclude base ASCII letters (a–z, A–Z) from the appendix
+        if ch in ASCII_LETTERS:
+            continue
+        cp = f"U+{ord(ch):04X}"
+        out.append((ch, cp, name))
+
+    cursor.execute('SELECT COUNT(*) FROM characters WHERE is_latin = 1')
+    total_points = cursor.fetchone()[0]
+    cursor.execute('SELECT COUNT(*) FROM characters WHERE is_latin = 1 AND has_ascii_base = 1')
+    in_scope = cursor.fetchone()[0]
+
+    return out, {'total_points': total_points, 'in_scope': in_scope, 'out_of_scope': len(out)}
 
 def setup_fonts():
     """
@@ -341,7 +369,7 @@ class PDFDocTemplate(BaseDocTemplate):
         template = PageTemplate(id='normal', frames=[frame])
         self.addPageTemplates([template])
 
-def generate_pdf_report(results_tuple, output_filename):
+def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index, coverage_summary, output_filename):
     """
     Generate a PDF report with the analysis results.
     Args:
@@ -350,8 +378,8 @@ def generate_pdf_report(results_tuple, output_filename):
     """
     one_diacritic_results, two_diacritics_results = results_tuple
     
-    # Process other Latin LGR occurrences
-    other_lgr_occurrences = process_other_latin_lgr_occurrences()
+    # Process sequences with ASCII base from LGR (XML-derived)
+    other_lgr_occurrences = sequences_ascii_base
     
     print(f"Generating PDF report to {output_filename}...")
     print(f"Found {len(one_diacritic_results)} characters with one diacritic")
@@ -416,7 +444,7 @@ def generate_pdf_report(results_tuple, output_filename):
     content.append(Paragraph(f"This version of the report was generated at: {timestamp}", styles['Italic']))
 
     # Introduction
-    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.1), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
+    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.2), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
     
     content.append(Spacer(1, 20))
     content.append(Paragraph(explanation, custom_style))
@@ -570,6 +598,43 @@ def generate_pdf_report(results_tuple, output_filename):
     
     table3.setStyle(table3_style)
     content.append(table3)
+
+    # Coverage summary
+    content.append(Spacer(1, 20))
+    summary_text = (
+        f"Coverage Summary — Latin repertoire single code points: {coverage_summary.get('total_points', '?')}; "
+        f"in-scope (ASCII base + combining): {coverage_summary.get('in_scope', '?')}; "
+        f"out-of-scope (indexed below): {coverage_summary.get('out_of_scope', '?')}; "
+        f"sequences in LGR: {coverage_summary.get('total_sequences', '?')}; "
+        f"sequences shown (ASCII base): {coverage_summary.get('ascii_base_sequences', '?')}."
+    )
+    content.append(Paragraph(summary_text, custom_style))
+
+    # Compact appendix: out-of-scope index
+    content.append(Spacer(1, 12))
+    content.append(Paragraph(f"Appendix: Latin repertoire not canonically decomposable to ASCII base (+ combining) ({len(out_of_scope_index)})", heading2_style))
+
+    appendix_data = [["Glyph", "Code point", "Name"]]
+    for ch, cp, name in out_of_scope_index:
+        appendix_data.append([
+            Paragraph(f"<para align='center'><font face='{main_font}' size='12'>{ch}</font></para>", detailed_decomp_style),
+            Paragraph(f"{cp}", detailed_decomp_style),
+            Paragraph(f"{name}", detailed_decomp_style),
+        ])
+
+    appendix_table = Table(appendix_data, colWidths=[60, 90, 380])
+    appendix_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E0F7F7')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, -1), main_font),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ])
+    appendix_table.setStyle(appendix_style)
+    content.append(appendix_table)
     
     # Build PDF
     doc.build(content)
@@ -579,8 +644,9 @@ def generate_pdf_report(results_tuple, output_filename):
 def main():
     """Main execution function."""
     try:
-        # Step 1: Fetch data from URL
-        characters = fetch_data_from_url(URL)
+        # Step 1: Parse normative XML (Latin RZ-LGR) — authoritative repertoire
+        latin_points, latin_sequences = parse_lgr_xml(XML_URL)
+        characters = [chr(cp) for cp in latin_points]
         
         # Step 2: Set up temporary database
         conn = setup_temp_database()
@@ -591,13 +657,26 @@ def main():
         # Step 4: Analyze characters
         results_tuple = analyze_characters(conn)
         one_diacritic_results, two_diacritics_results = results_tuple
+
+        # Derive sequences (ASCII base) from XML repertoire sequences
+        sequences_ascii_base = classify_sequences_ascii_base(latin_sequences)
+
+        # Build out-of-scope index and coverage counts
+        out_of_scope_index, base_counts = get_out_of_scope_from_db(conn)
+        coverage_summary = {
+            'total_points': base_counts.get('total_points', 0),
+            'in_scope': base_counts.get('in_scope', 0),
+            'out_of_scope': base_counts.get('out_of_scope', 0),
+            'total_sequences': len(latin_sequences),
+            'ascii_base_sequences': len(sequences_ascii_base),
+        }
         
         # Print summary to console
         total_results = len(one_diacritic_results) + len(two_diacritics_results)
         print(f"Found {total_results} Latin characters with ASCII base + diacritics")
         
         # Step 5: Generate PDF report
-        pdf_path = generate_pdf_report(results_tuple, PDF_OUTPUT)
+        pdf_path = generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index, coverage_summary, PDF_OUTPUT)
         
         print(f"Analysis complete! PDF report saved to: {pdf_path}")
         
