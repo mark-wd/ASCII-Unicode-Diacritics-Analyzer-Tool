@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASCII-Unicode Diacritics Analyzer Tool (v1.3)
+ASCII-Unicode Diacritics Analyzer Tool (v1.3.1)
 On behalf of the ICANN Latin Script Diacritics Policy Development Process WG (LD-WG)
 
 For inquiries about the code, contact:
@@ -38,6 +38,7 @@ For more information, please refer to <https://unlicense.org>
 """
 
 import os
+import re
 import sys
 import sqlite3
 import unicodedata
@@ -62,6 +63,7 @@ XML_URL = "https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-2
 current_date = datetime.date.today().strftime("%Y-%m-%d")
 PDF_OUTPUT = f"LD-PDP-ASCII-Unicode-Diacritics-Report-{current_date}.pdf"
 ASCII_LETTERS = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+THESIS_SMALL_NAME_PATTERN = re.compile(r'^LATIN SMALL LETTER [A-Z] WITH .+$')
 
 
 def format_code_point_string(characters):
@@ -227,6 +229,7 @@ def parse_lgr_xml(url):
     Parse the normative Latin RZ-LGR XML and return:
       - latin_points: list[int] of single code points in the repertoire
       - latin_sequences: list[list[int]] of repertoire sequences
+      - blocked_variants: set[str] of blocked variant characters/sequences
     """
     resp = requests.get(url)
     resp.raise_for_status()
@@ -241,12 +244,26 @@ def parse_lgr_xml(url):
 
     latin_points = []
     latin_sequences = []
+    blocked_variants = set()
     if data_elem is None:
-        return (latin_points, latin_sequences)
+        return (latin_points, latin_sequences, blocked_variants)
 
     for ch in data_elem:
         if not ch.tag.endswith('char'):
             continue
+
+        for child in ch:
+            if not child.tag.endswith('var'):
+                continue
+            if child.get('type') != 'blocked':
+                continue
+
+            var_attr = child.get('cp') or child.get('cps')
+            if not var_attr:
+                continue
+
+            codes = [int(part, 16) for part in var_attr.strip().split()]
+            blocked_variants.add(''.join(chr(code) for code in codes))
 
         # Filter non-Latin single code points by tag attribute (e.g., tag="sc:Grek").
         # Sequences often omit 'tag'; we collect them and filter later by ASCII-base logic.
@@ -291,7 +308,7 @@ def parse_lgr_xml(url):
             seen_seq.add(t)
             uniq_sequences.append(seq)
 
-    return (uniq_points, uniq_sequences)
+    return (uniq_points, uniq_sequences, blocked_variants)
 
 
 def classify_sequences_ascii_base(latin_sequences):
@@ -324,7 +341,7 @@ def classify_sequences_ascii_base(latin_sequences):
 def collect_thesis_small_from_db(conn):
     """
     Collect Latin repertoire characters whose Unicode name matches:
-    LATIN SMALL LETTER ... WITH ...
+    LATIN SMALL LETTER [A-Z] WITH ...
     """
     cursor = conn.cursor()
     cursor.execute('SELECT character, name FROM characters WHERE is_latin = 1')
@@ -332,9 +349,7 @@ def collect_thesis_small_from_db(conn):
 
     results = []
     for char, name in rows:
-        if not name.startswith('LATIN SMALL LETTER '):
-            continue
-        if ' WITH ' not in name:
+        if not THESIS_SMALL_NAME_PATTERN.match(name):
             continue
 
         nfd_form = unicodedata.normalize('NFD', char)
@@ -348,36 +363,41 @@ def collect_thesis_small_from_db(conn):
     return results
 
 
-def filter_thesis_entries_to_additions(conn, thesis_entries):
-    """Keep only entries that are not already covered by the default theory."""
+def filter_thesis_entries_to_additions(conn, thesis_entries, blocked_variants=None):
+    """Keep only entries that are new to the thesis and not blocked in the RZ-LGR."""
     cursor = conn.cursor()
     cursor.execute('SELECT character FROM characters WHERE is_latin = 1 AND has_ascii_base = 1')
     already_in_scope = {row[0] for row in cursor.fetchall()}
+    blocked_variants = blocked_variants or set()
 
-    return [entry for entry in thesis_entries if entry[0] not in already_in_scope]
+    return [
+        entry for entry in thesis_entries
+        if entry[0] not in already_in_scope and entry[0] not in blocked_variants
+    ]
 
 
 THESIS_FLAGS = {
     '-thesis-small': {
-        'title': "Thesis Section: LATIN SMALL LETTER ... WITH ...",
+        'title': "Thesis Section: LATIN SMALL LETTER [A-Z] WITH ...",
         'description': (
             "Additional Latin repertoire characters whose Unicode name matches "
-            "the pattern 'LATIN SMALL LETTER ... WITH ...', excluding those "
-            "already covered by the default decomposable theory."
+            "the pattern 'LATIN SMALL LETTER [A-Z] WITH ...', excluding those "
+            "already covered by the default decomposable theory and excluding "
+            "blocked variants in the RZ-LGR."
         ),
-        'help': "Append only additional characters named 'LATIN SMALL LETTER ... WITH ...'.",
+        'help': "Append only additional, non-blocked characters named 'LATIN SMALL LETTER [A-Z] WITH ...'.",
         'collector': collect_thesis_small_from_db,
     },
 }
 
 
-def collect_requested_thesis_sections(conn, enabled_flags):
+def collect_requested_thesis_sections(conn, enabled_flags, blocked_variants=None):
     """Build thesis sections requested through CLI flags."""
     thesis_sections = []
     for flag in enabled_flags:
         definition = THESIS_FLAGS[flag]
         raw_entries = definition['collector'](conn)
-        filtered_entries = filter_thesis_entries_to_additions(conn, raw_entries)
+        filtered_entries = filter_thesis_entries_to_additions(conn, raw_entries, blocked_variants)
         thesis_sections.append({
             'flag': flag,
             'title': definition['title'],
@@ -545,7 +565,7 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     content.append(Paragraph(f"This version of the report was generated at: {timestamp}", styles['Italic']))
 
     # Introduction
-    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.3), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
+    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.3.1), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
     
     content.append(Spacer(1, 20))
     content.append(Paragraph(explanation, custom_style))
@@ -813,7 +833,7 @@ def main():
         enabled_thesis_flags = parse_cli_args(sys.argv)
 
         # Step 1: Parse normative XML (Latin RZ-LGR) — authoritative repertoire
-        latin_points, latin_sequences = parse_lgr_xml(XML_URL)
+        latin_points, latin_sequences, blocked_variants = parse_lgr_xml(XML_URL)
         characters = [chr(cp) for cp in latin_points]
         
         # Step 2: Set up temporary database
@@ -830,7 +850,7 @@ def main():
         sequences_ascii_base = classify_sequences_ascii_base(latin_sequences)
 
         # Collect requested thesis sections
-        thesis_sections = collect_requested_thesis_sections(conn, enabled_thesis_flags)
+        thesis_sections = collect_requested_thesis_sections(conn, enabled_thesis_flags, blocked_variants)
 
         # Build out-of-scope index and coverage counts
         out_of_scope_index, base_counts = get_out_of_scope_from_db(conn)

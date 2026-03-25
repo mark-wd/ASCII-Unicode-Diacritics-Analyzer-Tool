@@ -47,7 +47,7 @@ This will:
 
 ### Thesis flags
 
-- `-thesis-small`: appends a section containing only the **additional** Latin repertoire characters whose Unicode name matches `LATIN SMALL LETTER ... WITH ...`, excluding characters already covered by the default decomposable theory.
+- `-thesis-small`: appends a section containing only the **additional** Latin repertoire characters whose Unicode name matches `LATIN SMALL LETTER [A-Z] WITH ...`, excluding characters already covered by the default decomposable theory, excluding blocked variants in the RZ-LGR, and excluding non-ASCII name stems such as `EZH`.
 
 ## Output
 
