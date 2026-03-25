@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASCII-Unicode Diacritics Analyzer Tool (v1.2)
+ASCII-Unicode Diacritics Analyzer Tool (v1.3)
 On behalf of the ICANN Latin Script Diacritics Policy Development Process WG (LD-WG)
 
 For inquiries about the code, contact:
@@ -38,6 +38,7 @@ For more information, please refer to <https://unlicense.org>
 """
 
 import os
+import sys
 import sqlite3
 import unicodedata
 import requests
@@ -61,6 +62,66 @@ XML_URL = "https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-2
 current_date = datetime.date.today().strftime("%Y-%m-%d")
 PDF_OUTPUT = f"LD-PDP-ASCII-Unicode-Diacritics-Report-{current_date}.pdf"
 ASCII_LETTERS = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+
+
+def format_code_point_string(characters):
+    """Return one or more code points in U+XXXX format."""
+    return ' '.join(f"U+{ord(c):04X}" for c in characters)
+
+
+def build_detailed_decomposition(characters):
+    """Build a report-friendly decomposition string with names and code points."""
+    detailed_decomp_parts = []
+    for c in characters:
+        char_name = unicodedata.name(c, 'UNKNOWN')
+        code_point = f"U+{ord(c):04X}"
+
+        # Add extra spacing around combining characters to prevent them from
+        # visually merging with surrounding text in the PDF.
+        if unicodedata.category(c).startswith('M'):
+            formatted_char = f"&nbsp;{c}&nbsp;"
+        else:
+            formatted_char = c
+
+        detailed_decomp_parts.append(f"{formatted_char} ({char_name}, {code_point})")
+
+    return ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
+
+
+def print_usage():
+    """Print CLI usage information."""
+    script_name = os.path.basename(__file__)
+    print(f"Usage: py {script_name} [-thesis-small]")
+    print()
+    print("Optional thesis flags:")
+    for flag, definition in THESIS_FLAGS.items():
+        print(f"  {flag:<16} {definition['help']}")
+
+
+def parse_cli_args(argv):
+    """Parse supported CLI flags without changing the current default behavior."""
+    enabled_flags = []
+    seen = set()
+    unknown_flags = []
+
+    for arg in argv[1:]:
+        if arg in ('-h', '--help'):
+            print_usage()
+            raise SystemExit(0)
+
+        if arg in THESIS_FLAGS:
+            if arg not in seen:
+                enabled_flags.append(arg)
+                seen.add(arg)
+        else:
+            unknown_flags.append(arg)
+
+    if unknown_flags:
+        raise ValueError(
+            f"Unknown argument(s): {', '.join(unknown_flags)}. Use -h or --help for usage."
+        )
+
+    return enabled_flags
 
 
 
@@ -148,25 +209,7 @@ def analyze_characters(conn):
             
             # Get all diacritics (combining marks)
             diacritics = ''.join(c for c in nfd_form[1:] if unicodedata.category(c).startswith('M'))
-            
-            # Create detailed decomposition with names and code points
-            detailed_decomp_parts = []
-            for c in nfd_form:
-                char_name = unicodedata.name(c, 'UNKNOWN')
-                code_point = f"U+{ord(c):04X}"
-                
-                # Add extra spacing around combining characters to prevent them from combining with surrounding text or appearing too close to parentheses
-                if unicodedata.category(c).startswith('M'):
-                    # For combining characters, add space before and after
-                    formatted_char = f"&nbsp;{c}&nbsp;"
-                else:
-                    # For base characters, just use as is
-                    formatted_char = c
-                
-                detailed_decomp_parts.append(f"{formatted_char} ({char_name}, {code_point})")
-            
-            # Use HTML formatting for better spacing around the + sign in detailed decomp
-            detailed_decomp = ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
+            detailed_decomp = build_detailed_decomposition(nfd_form)
             
             # Add to appropriate result list based on number of diacritics
             if len(diacritics) == 1:
@@ -273,18 +316,75 @@ def classify_sequences_ascii_base(latin_sequences):
             continue
 
         # Detailed decomposition built from the original code points in the sequence
-        detailed_decomp_parts = []
-        for c in chars:
-            name = unicodedata.name(c, 'UNKNOWN')
-            code_point = f"U+{ord(c):04X}"
-            if unicodedata.category(c).startswith('M'):
-                formatted_char = f"&nbsp;{c}&nbsp;"
-            else:
-                formatted_char = c
-            detailed_decomp_parts.append(f"{formatted_char} ({name}, {code_point})")
-        detailed_decomp = ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
+        detailed_decomp = build_detailed_decomposition(chars)
         results.append((combined, base, diacritics, detailed_decomp))
     return results
+
+
+def collect_thesis_small_from_db(conn):
+    """
+    Collect Latin repertoire characters whose Unicode name matches:
+    LATIN SMALL LETTER ... WITH ...
+    """
+    cursor = conn.cursor()
+    cursor.execute('SELECT character, name FROM characters WHERE is_latin = 1')
+    rows = cursor.fetchall()
+
+    results = []
+    for char, name in rows:
+        if not name.startswith('LATIN SMALL LETTER '):
+            continue
+        if ' WITH ' not in name:
+            continue
+
+        nfd_form = unicodedata.normalize('NFD', char)
+        results.append((
+            char,
+            format_code_point_string(char),
+            name,
+            build_detailed_decomposition(nfd_form),
+        ))
+
+    return results
+
+
+def filter_thesis_entries_to_additions(conn, thesis_entries):
+    """Keep only entries that are not already covered by the default theory."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT character FROM characters WHERE is_latin = 1 AND has_ascii_base = 1')
+    already_in_scope = {row[0] for row in cursor.fetchall()}
+
+    return [entry for entry in thesis_entries if entry[0] not in already_in_scope]
+
+
+THESIS_FLAGS = {
+    '-thesis-small': {
+        'title': "Thesis Section: LATIN SMALL LETTER ... WITH ...",
+        'description': (
+            "Additional Latin repertoire characters whose Unicode name matches "
+            "the pattern 'LATIN SMALL LETTER ... WITH ...', excluding those "
+            "already covered by the default decomposable theory."
+        ),
+        'help': "Append only additional characters named 'LATIN SMALL LETTER ... WITH ...'.",
+        'collector': collect_thesis_small_from_db,
+    },
+}
+
+
+def collect_requested_thesis_sections(conn, enabled_flags):
+    """Build thesis sections requested through CLI flags."""
+    thesis_sections = []
+    for flag in enabled_flags:
+        definition = THESIS_FLAGS[flag]
+        raw_entries = definition['collector'](conn)
+        filtered_entries = filter_thesis_entries_to_additions(conn, raw_entries)
+        thesis_sections.append({
+            'flag': flag,
+            'title': definition['title'],
+            'description': definition['description'],
+            'entries': filtered_entries,
+        })
+    return thesis_sections
 
 
 def get_out_of_scope_from_db(conn):
@@ -369,7 +469,7 @@ class PDFDocTemplate(BaseDocTemplate):
         template = PageTemplate(id='normal', frames=[frame])
         self.addPageTemplates([template])
 
-def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index, coverage_summary, output_filename):
+def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index, coverage_summary, output_filename, thesis_sections=None):
     """
     Generate a PDF report with the analysis results.
     Args:
@@ -377,6 +477,7 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
         output_filename (str): Name of the output PDF file
     """
     one_diacritic_results, two_diacritics_results = results_tuple
+    thesis_sections = thesis_sections or []
     
     # Process sequences with ASCII base from LGR (XML-derived)
     other_lgr_occurrences = sequences_ascii_base
@@ -444,7 +545,7 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     content.append(Paragraph(f"This version of the report was generated at: {timestamp}", styles['Italic']))
 
     # Introduction
-    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.2), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
+    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.3), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
     
     content.append(Spacer(1, 20))
     content.append(Paragraph(explanation, custom_style))
@@ -560,8 +661,7 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     for char, base_char, diacritic, detailed_decomp in other_lgr_occurrences:
         # For the character column, show both the character and its code point
         # We need to calculate the code point of the combined character
-        combined_code_points = [f"U+{ord(c):04X}" for c in char]
-        combined_code_point_str = " ".join(combined_code_points)
+        combined_code_point_str = format_code_point_string(char)
         
         char_cell = Paragraph(f"<para align='center'><font face='{main_font}' size='16'>{char}</font><br/><font size='8'>{combined_code_point_str}</font></para>", custom_style)
         
@@ -599,6 +699,64 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     table3.setStyle(table3_style)
     content.append(table3)
 
+    # Optional thesis sections
+    if thesis_sections:
+        content.append(Spacer(1, 30))
+
+    for thesis_section in thesis_sections:
+        entries = thesis_section.get('entries', [])
+        content.append(Paragraph(f"{thesis_section['title']} ({len(entries)})", heading2_style))
+        if thesis_section.get('description'):
+            content.append(Paragraph(thesis_section['description'], custom_style))
+            content.append(Spacer(1, 12))
+
+        if entries:
+            thesis_table_data = [["Character", "Code point", "Name", "Technical Details"]]
+
+            for char, code_point, name, detailed_decomp in entries:
+                char_cell = Paragraph(
+                    f"<para align='center'><font face='{main_font}' size='16'>{char}</font></para>",
+                    custom_style,
+                )
+                code_point_cell = Paragraph(code_point, detailed_decomp_style)
+                name_cell = Paragraph(name, detailed_decomp_style)
+                detailed_decomp_cell = Paragraph(
+                    f"<font face='{main_font}'>{detailed_decomp}</font>",
+                    detailed_decomp_style,
+                )
+                thesis_table_data.append([
+                    char_cell,
+                    code_point_cell,
+                    name_cell,
+                    detailed_decomp_cell,
+                ])
+
+            thesis_table = Table(thesis_table_data, colWidths=[60, 80, 190, 200])
+            thesis_table_style = TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#32CCCC')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), bold_font),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ])
+
+            for i in range(1, len(thesis_table_data)):
+                if i % 2 == 0:
+                    thesis_table_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
+
+            thesis_table.setStyle(thesis_table_style)
+            content.append(thesis_table)
+        else:
+            content.append(Paragraph("No characters matched this thesis.", custom_style))
+
+        content.append(Spacer(1, 30))
+
     # Coverage summary
     content.append(Spacer(1, 20))
     summary_text = (
@@ -608,6 +766,14 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
         f"sequences in LGR: {coverage_summary.get('total_sequences', '?')}; "
         f"sequences shown (ASCII base): {coverage_summary.get('ascii_base_sequences', '?')}."
     )
+
+    if thesis_sections:
+        thesis_summary = '; '.join(
+            f"{section['flag']}: {len(section.get('entries', []))}"
+            for section in thesis_sections
+        )
+        summary_text += f" Thesis sections enabled — {thesis_summary}."
+
     content.append(Paragraph(summary_text, custom_style))
 
     # Compact appendix: out-of-scope index
@@ -644,6 +810,8 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
 def main():
     """Main execution function."""
     try:
+        enabled_thesis_flags = parse_cli_args(sys.argv)
+
         # Step 1: Parse normative XML (Latin RZ-LGR) — authoritative repertoire
         latin_points, latin_sequences = parse_lgr_xml(XML_URL)
         characters = [chr(cp) for cp in latin_points]
@@ -661,6 +829,9 @@ def main():
         # Derive sequences (ASCII base) from XML repertoire sequences
         sequences_ascii_base = classify_sequences_ascii_base(latin_sequences)
 
+        # Collect requested thesis sections
+        thesis_sections = collect_requested_thesis_sections(conn, enabled_thesis_flags)
+
         # Build out-of-scope index and coverage counts
         out_of_scope_index, base_counts = get_out_of_scope_from_db(conn)
         coverage_summary = {
@@ -674,9 +845,22 @@ def main():
         # Print summary to console
         total_results = len(one_diacritic_results) + len(two_diacritics_results)
         print(f"Found {total_results} Latin characters with ASCII base + diacritics")
+
+        for thesis_section in thesis_sections:
+            print(
+                f"Added thesis section {thesis_section['flag']} "
+                f"with {len(thesis_section['entries'])} characters"
+            )
         
         # Step 5: Generate PDF report
-        pdf_path = generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index, coverage_summary, PDF_OUTPUT)
+        pdf_path = generate_pdf_report(
+            results_tuple,
+            sequences_ascii_base,
+            out_of_scope_index,
+            coverage_summary,
+            PDF_OUTPUT,
+            thesis_sections=thesis_sections,
+        )
         
         print(f"Analysis complete! PDF report saved to: {pdf_path}")
         

@@ -34,10 +34,20 @@ From the Analyzer-Tool/ directory:
 py LD-PDP-ASCII-Unicode-Diacritics-Analyzer-Tool.py
 ```
 
+Optional thesis flags can be passed to append additional sections to the PDF report:
+
+```
+py LD-PDP-ASCII-Unicode-Diacritics-Analyzer-Tool.py -thesis-small
+```
+
 This will:
 - Fetch the Latin RZ‑LGR XML (Unicode 11.0 repertoire).
 - Compute the in-scope set (ASCII base + combining diacritics).
 - Generate a PDF named: `LD-PDP-ASCII-Unicode-Diacritics-Report-YYYY-MM-DD.pdf`.
+
+### Thesis flags
+
+- `-thesis-small`: appends a section containing only the **additional** Latin repertoire characters whose Unicode name matches `LATIN SMALL LETTER ... WITH ...`, excluding characters already covered by the default decomposable theory.
 
 ## Output
 
@@ -45,6 +55,7 @@ The PDF includes:
 - Characters with one diacritic.
 - Characters with two diacritics.
 - Other sequences in the LGR whose base is ASCII, if any.
+- Any optional thesis sections requested by CLI flags.
 - Coverage summary and a compact appendix.
 - The tool attempts to download Noto Sans (Regular/Bold) for broad Unicode coverage. If unavailable, it falls back to Arial.
 
