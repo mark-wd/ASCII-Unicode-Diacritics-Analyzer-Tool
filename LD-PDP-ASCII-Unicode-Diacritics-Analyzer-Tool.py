@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASCII-Unicode Diacritics Analyzer Tool (v1.3.1)
+ASCII-Unicode Diacritics Analyzer Tool
 On behalf of the ICANN Latin Script Diacritics Policy Development Process WG (LD-WG)
 
 For inquiries about the code, contact:
@@ -40,6 +40,7 @@ For more information, please refer to <https://unlicense.org>
 import os
 import re
 import sys
+import json
 import sqlite3
 import unicodedata
 import requests
@@ -58,10 +59,12 @@ from reportlab.platypus.frames import Frame
 from reportlab.lib.colors import black
 
 # Constants
+TOOL_VERSION = "v1.4.0"
 XML_URL = "https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.xml"
 # Generate filename with current date in YYYY-MM-DD format
 current_date = datetime.date.today().strftime("%Y-%m-%d")
 PDF_OUTPUT = f"LD-PDP-ASCII-Unicode-Diacritics-Report-{current_date}.pdf"
+WEB_JSON_OUTPUT = os.path.join('web', 'data', 'latest.json')
 ASCII_LETTERS = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
 THESIS_SMALL_NAME_PATTERN = re.compile(r'^LATIN SMALL LETTER [A-Z] WITH .+$')
 
@@ -90,14 +93,31 @@ def build_detailed_decomposition(characters):
     return ' &nbsp;&nbsp;+&nbsp;&nbsp; '.join(detailed_decomp_parts)
 
 
+def build_plain_decomposition(characters):
+    """Build a plain-text decomposition string for JSON/web output."""
+    parts = []
+    for c in characters:
+        char_name = unicodedata.name(c, 'UNKNOWN')
+        code_point = f"U+{ord(c):04X}"
+        formatted_char = f" {c} " if unicodedata.category(c).startswith('M') else c
+        parts.append(f"{formatted_char} ({char_name}, {code_point})")
+
+    return ' + '.join(parts)
+
+
 def print_usage():
     """Print CLI usage information."""
     script_name = os.path.basename(__file__)
-    print(f"Usage: py {script_name} [-thesis-small]")
+    print(f"Usage: py {script_name} [-thesis-small] [--json-output PATH] [--json-only] [--web-json]")
     print()
     print("Optional thesis flags:")
     for flag, definition in THESIS_FLAGS.items():
         print(f"  {flag:<16} {definition['help']}")
+    print()
+    print("Optional output flags:")
+    print("  --json-output PATH   Write web-ready JSON output to PATH.")
+    print("  --json-only          Skip PDF generation (requires --json-output or --web-json).")
+    print(f"  --web-json           Shortcut for --json-output {WEB_JSON_OUTPUT} --json-only.")
 
 
 def parse_cli_args(argv):
@@ -105,8 +125,12 @@ def parse_cli_args(argv):
     enabled_flags = []
     seen = set()
     unknown_flags = []
+    json_output = None
+    json_only = False
 
-    for arg in argv[1:]:
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
         if arg in ('-h', '--help'):
             print_usage()
             raise SystemExit(0)
@@ -115,15 +139,34 @@ def parse_cli_args(argv):
             if arg not in seen:
                 enabled_flags.append(arg)
                 seen.add(arg)
+        elif arg == '--json-output':
+            if index + 1 >= len(argv):
+                raise ValueError("--json-output requires a file path.")
+            json_output = argv[index + 1]
+            index += 1
+        elif arg == '--json-only':
+            json_only = True
+        elif arg == '--web-json':
+            json_output = WEB_JSON_OUTPUT
+            json_only = True
         else:
             unknown_flags.append(arg)
+
+        index += 1
 
     if unknown_flags:
         raise ValueError(
             f"Unknown argument(s): {', '.join(unknown_flags)}. Use -h or --help for usage."
         )
 
-    return enabled_flags
+    if json_only and not json_output:
+        raise ValueError("--json-only requires --json-output PATH or --web-json.")
+
+    return {
+        'enabled_thesis_flags': enabled_flags,
+        'json_output': json_output,
+        'json_only': json_only,
+    }
 
 
 
@@ -378,7 +421,7 @@ def filter_thesis_entries_to_additions(conn, thesis_entries, blocked_variants=No
 
 THESIS_FLAGS = {
     '-thesis-small': {
-        'title': "Thesis Section: LATIN SMALL LETTER [A-Z] WITH ...",
+        'title': "Thesis Section: Latin Small Letters",
         'description': (
             "Additional Latin repertoire characters whose Unicode name matches "
             "the pattern 'LATIN SMALL LETTER [A-Z] WITH ...', excluding those "
@@ -407,29 +450,257 @@ def collect_requested_thesis_sections(conn, enabled_flags, blocked_variants=None
     return thesis_sections
 
 
-def get_out_of_scope_from_db(conn):
-    """
-    Read characters stored in DB and return:
-      - out_of_scope_index: list of tuples (char, U+XXXX, NAME) where has_ascii_base = 0
-      - counts: dict with total_points, in_scope, out_of_scope
-    """
+def get_latin_repertoire_rows(conn):
+    """Return all Latin repertoire single code points stored in the database."""
     cursor = conn.cursor()
-    cursor.execute('SELECT character, name FROM characters WHERE is_latin = 1 AND has_ascii_base = 0')
-    rows = cursor.fetchall()
-    out = []
-    for ch, name in rows:
-        # Exclude base ASCII letters (a–z, A–Z) from the appendix
+    cursor.execute('SELECT character, name FROM characters WHERE is_latin = 1')
+    return cursor.fetchall()
+
+
+def get_base_in_scope_characters(conn):
+    """Return the default decomposable in-scope character set."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT character FROM characters WHERE is_latin = 1 AND has_ascii_base = 1')
+    return {row[0] for row in cursor.fetchall()}
+
+
+def build_scope_snapshot(conn, thesis_sections=None):
+    """Build the effective in-scope set and appendix for a given thesis selection."""
+    thesis_sections = thesis_sections or []
+    effective_in_scope = set(get_base_in_scope_characters(conn))
+
+    for section in thesis_sections:
+        effective_in_scope.update(entry[0] for entry in section.get('entries', []))
+
+    repertoire_rows = get_latin_repertoire_rows(conn)
+    out_of_scope_index = []
+    for ch, name in repertoire_rows:
         if ch in ASCII_LETTERS:
             continue
-        cp = f"U+{ord(ch):04X}"
-        out.append((ch, cp, name))
+        if ch in effective_in_scope:
+            continue
+        out_of_scope_index.append((ch, f"U+{ord(ch):04X}", name))
 
-    cursor.execute('SELECT COUNT(*) FROM characters WHERE is_latin = 1')
-    total_points = cursor.fetchone()[0]
-    cursor.execute('SELECT COUNT(*) FROM characters WHERE is_latin = 1 AND has_ascii_base = 1')
-    in_scope = cursor.fetchone()[0]
+    return {
+        'in_scope_characters': effective_in_scope,
+        'out_of_scope_index': out_of_scope_index,
+        'coverage_counts': {
+            'total_points': len(repertoire_rows),
+            'in_scope': len(effective_in_scope),
+            'out_of_scope': len(out_of_scope_index),
+        },
+    }
 
-    return out, {'total_points': total_points, 'in_scope': in_scope, 'out_of_scope': len(out)}
+
+def build_table_section(section_id, title, description, columns, rows):
+    """Return a generic table section structure for compact web rendering."""
+    return {
+        'id': section_id,
+        'title': title,
+        'description': description,
+        'type': 'table',
+        'rowCount': len(rows),
+        'columns': columns,
+        'rows': rows,
+    }
+
+
+def serialize_analysis_rows(results):
+    """Serialize standard analysis rows for JSON/web output."""
+    rows = []
+    for char, base_char, diacritics, _detailed_decomp in results:
+        decomposition_source = list(char) if len(char) > 1 else unicodedata.normalize('NFD', char)
+        rows.append({
+            'character': char,
+            'codePoints': format_code_point_string(char),
+            'base': base_char,
+            'diacritics': diacritics,
+            'details': build_plain_decomposition(decomposition_source),
+        })
+    return rows
+
+
+def serialize_thesis_rows(entries):
+    """Serialize thesis rows for JSON/web output."""
+    rows = []
+    for char, code_point, name, _detailed_decomp in entries:
+        rows.append({
+            'character': char,
+            'codePoint': code_point,
+            'name': name,
+            'details': build_plain_decomposition(unicodedata.normalize('NFD', char)),
+        })
+    return rows
+
+
+def serialize_out_of_scope_rows(out_of_scope_index):
+    """Serialize appendix rows for JSON/web output."""
+    return [
+        {
+            'character': ch,
+            'codePoint': cp,
+            'name': name,
+        }
+        for ch, cp, name in out_of_scope_index
+    ]
+
+
+def build_primary_web_sections(results_tuple, sequences_ascii_base):
+    """Build the common compact sections shown in every web mode except the appendix."""
+    one_diacritic_results, two_diacritics_results = results_tuple
+
+    return [
+        build_table_section(
+            'one-diacritic',
+            'One Diacritic',
+            'Latin repertoire characters whose canonical decomposition is an ASCII base letter plus one combining mark.',
+            [
+                {'key': 'character', 'label': 'Char'},
+                {'key': 'codePoints', 'label': 'Code point'},
+                {'key': 'base', 'label': 'Base'},
+                {'key': 'diacritics', 'label': 'Mark'},
+                {'key': 'details', 'label': 'Technical details'},
+            ],
+            serialize_analysis_rows(one_diacritic_results),
+        ),
+        build_table_section(
+            'two-plus-diacritics',
+            'Two or More Diacritics',
+            'Latin repertoire characters whose canonical decomposition is an ASCII base letter plus multiple combining marks.',
+            [
+                {'key': 'character', 'label': 'Char'},
+                {'key': 'codePoints', 'label': 'Code point'},
+                {'key': 'base', 'label': 'Base'},
+                {'key': 'diacritics', 'label': 'Marks'},
+                {'key': 'details', 'label': 'Technical details'},
+            ],
+            serialize_analysis_rows(two_diacritics_results),
+        ),
+        build_table_section(
+            'lgr-sequences',
+            'Other LGR Sequences',
+            'Repertoire sequences in the LGR that begin with an ASCII base letter and continue with combining marks.',
+            [
+                {'key': 'character', 'label': 'Sequence'},
+                {'key': 'codePoints', 'label': 'Code points'},
+                {'key': 'base', 'label': 'Base'},
+                {'key': 'diacritics', 'label': 'Marks'},
+                {'key': 'details', 'label': 'Technical details'},
+            ],
+            serialize_analysis_rows(sequences_ascii_base),
+        ),
+    ]
+
+
+def build_appendix_web_section(out_of_scope_index):
+    """Build the appendix section for a specific effective scope."""
+    return build_table_section(
+        'out-of-scope',
+        'Appendix: Out of Scope',
+        'Latin repertoire entries that are not canonically decomposable to an ASCII base plus combining marks.',
+        [
+            {'key': 'character', 'label': 'Glyph'},
+            {'key': 'codePoint', 'label': 'Code point'},
+            {'key': 'name', 'label': 'Name'},
+        ],
+        serialize_out_of_scope_rows(out_of_scope_index),
+    )
+
+def build_web_mode(mode_id, label, description, enabled_flags, primary_sections, thesis_sections, scope_snapshot, total_sequences, ascii_base_sequences):
+    """Build one web mode, combining common sections with any thesis sections."""
+    serialized_thesis_sections = []
+    thesis_counts = {}
+    for section in thesis_sections:
+        rows = serialize_thesis_rows(section.get('entries', []))
+        serialized_thesis_sections.append(build_table_section(
+            section['flag'].lstrip('-'),
+            section['title'],
+            section.get('description', ''),
+            [
+                {'key': 'character', 'label': 'Char'},
+                {'key': 'codePoint', 'label': 'Code point'},
+                {'key': 'name', 'label': 'Name'},
+                {'key': 'details', 'label': 'Technical details'},
+            ],
+            rows,
+        ))
+        thesis_counts[section['flag']] = len(rows)
+
+    return {
+        'id': mode_id,
+        'label': label,
+        'description': description,
+        'enabledFlags': enabled_flags,
+        'coverageSummary': {
+            **scope_snapshot.get('coverage_counts', {}),
+            'total_sequences': total_sequences,
+            'ascii_base_sequences': ascii_base_sequences,
+            'thesisCounts': thesis_counts,
+        },
+        'sections': [
+            *serialized_thesis_sections,
+            *primary_sections,
+            build_appendix_web_section(scope_snapshot.get('out_of_scope_index', [])),
+        ],
+    }
+
+
+def build_web_report_payload(conn, results_tuple, sequences_ascii_base, latin_sequences, thesis_sections_by_flag):
+    """Build the full JSON payload consumed by the compact web frontend."""
+    primary_sections = build_primary_web_sections(results_tuple, sequences_ascii_base)
+    base_plus_small_sections = []
+    if '-thesis-small' in thesis_sections_by_flag:
+        base_plus_small_sections.append(thesis_sections_by_flag['-thesis-small'])
+
+    base_scope_snapshot = build_scope_snapshot(conn, [])
+    base_plus_small_scope_snapshot = build_scope_snapshot(conn, base_plus_small_sections)
+
+    return {
+        'generatedAt': datetime.datetime.now().isoformat(),
+        'toolVersion': TOOL_VERSION,
+        'source': {
+            'xmlUrl': XML_URL,
+            'reportDate': current_date,
+        },
+        'defaultMode': 'base',
+        'modes': [
+            build_web_mode(
+                'base',
+                'Base thesis',
+                'Core decomposable theory only.',
+                [],
+                primary_sections,
+                [],
+                base_scope_snapshot,
+                len(latin_sequences),
+                len(sequences_ascii_base),
+            ),
+            build_web_mode(
+                'base-plus-small',
+                'Base + Latin Small Letters',
+                'Core decomposable theory plus the additional Latin Small Letters thesis section.',
+                ['-thesis-small'],
+                primary_sections,
+                base_plus_small_sections,
+                base_plus_small_scope_snapshot,
+                len(latin_sequences),
+                len(sequences_ascii_base),
+            ),
+        ],
+    }
+
+
+def write_web_json_report(output_path, payload):
+    """Write the compact web payload to disk."""
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(output_path, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    return output_path
+
 
 def setup_fonts():
     """
@@ -565,10 +836,68 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     content.append(Paragraph(f"This version of the report was generated at: {timestamp}", styles['Italic']))
 
     # Introduction
-    explanation = "This report was generated using the ASCII-Unicode Diacritics Analyzer Tool (v1.3.1), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
+    explanation = f"This report was generated using the ASCII-Unicode Diacritics Analyzer Tool ({TOOL_VERSION}), and can be generated by any other interested party with <a href='https://github.com/mark-wd/ASCII-Unicode-Diacritics-Analyzer-Tool/tree/main' color='blue'>the tool's Python source code in Github</a>, released under 'The Unlicense', equivalent to Public Domain. This software was developed independently by a community member, with no official affiliation with or endorsement by the ICANN organization.<br/><br/>The tool implements Unicode normalization (NFD) to analyze Latin script code points from ICANN's <a href='https://www.icann.org/sites/default/files/lgr/rz-lgr-5-latin-script-26may22-en.html' color='blue'>Label Generation Rules</a> and identifies characters that canonically decompose to ASCII base characters plus combining diacritical marks (Unicode General Category M). Results are categorized by diacritic count and output to this structured PDF report with complete Unicode technical data.<br/><br/>For inquiries about the code, contact the maintainer:<br/>Mark W. Datysgeld (mark@governanceprimer.com)"
     
     content.append(Spacer(1, 20))
     content.append(Paragraph(explanation, custom_style))
+
+    # Optional thesis sections appear before the main decomposition tables
+    if thesis_sections:
+        content.append(Spacer(1, 30))
+
+    for thesis_section in thesis_sections:
+        entries = thesis_section.get('entries', [])
+        content.append(Paragraph(f"{thesis_section['title']} ({len(entries)})", heading2_style))
+        if thesis_section.get('description'):
+            content.append(Paragraph(thesis_section['description'], custom_style))
+            content.append(Spacer(1, 12))
+
+        if entries:
+            thesis_table_data = [["Character", "Code point", "Name", "Technical Details"]]
+
+            for char, code_point, name, detailed_decomp in entries:
+                char_cell = Paragraph(
+                    f"<para align='center'><font face='{main_font}' size='16'>{char}</font></para>",
+                    custom_style,
+                )
+                code_point_cell = Paragraph(code_point, detailed_decomp_style)
+                name_cell = Paragraph(name, detailed_decomp_style)
+                detailed_decomp_cell = Paragraph(
+                    f"<font face='{main_font}'>{detailed_decomp}</font>",
+                    detailed_decomp_style,
+                )
+                thesis_table_data.append([
+                    char_cell,
+                    code_point_cell,
+                    name_cell,
+                    detailed_decomp_cell,
+                ])
+
+            thesis_table = Table(thesis_table_data, colWidths=[60, 80, 190, 200])
+            thesis_table_style = TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#32CCCC')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), bold_font),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ])
+
+            for i in range(1, len(thesis_table_data)):
+                if i % 2 == 0:
+                    thesis_table_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
+
+            thesis_table.setStyle(thesis_table_style)
+            content.append(thesis_table)
+        else:
+            content.append(Paragraph("No characters matched this thesis.", custom_style))
+
+        content.append(Spacer(1, 30))
     
     # ===== TABLE 1: Characters with One Diacritic =====
     content.append(Paragraph(f"Characters with One Diacritic Mark ({len(one_diacritic_results)})", heading2_style))
@@ -719,64 +1048,6 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
     table3.setStyle(table3_style)
     content.append(table3)
 
-    # Optional thesis sections
-    if thesis_sections:
-        content.append(Spacer(1, 30))
-
-    for thesis_section in thesis_sections:
-        entries = thesis_section.get('entries', [])
-        content.append(Paragraph(f"{thesis_section['title']} ({len(entries)})", heading2_style))
-        if thesis_section.get('description'):
-            content.append(Paragraph(thesis_section['description'], custom_style))
-            content.append(Spacer(1, 12))
-
-        if entries:
-            thesis_table_data = [["Character", "Code point", "Name", "Technical Details"]]
-
-            for char, code_point, name, detailed_decomp in entries:
-                char_cell = Paragraph(
-                    f"<para align='center'><font face='{main_font}' size='16'>{char}</font></para>",
-                    custom_style,
-                )
-                code_point_cell = Paragraph(code_point, detailed_decomp_style)
-                name_cell = Paragraph(name, detailed_decomp_style)
-                detailed_decomp_cell = Paragraph(
-                    f"<font face='{main_font}'>{detailed_decomp}</font>",
-                    detailed_decomp_style,
-                )
-                thesis_table_data.append([
-                    char_cell,
-                    code_point_cell,
-                    name_cell,
-                    detailed_decomp_cell,
-                ])
-
-            thesis_table = Table(thesis_table_data, colWidths=[60, 80, 190, 200])
-            thesis_table_style = TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#32CCCC')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-                ('ALIGN', (0, 1), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), bold_font),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ])
-
-            for i in range(1, len(thesis_table_data)):
-                if i % 2 == 0:
-                    thesis_table_style.add('BACKGROUND', (0, i), (-1, i), colors.lightgrey)
-
-            thesis_table.setStyle(thesis_table_style)
-            content.append(thesis_table)
-        else:
-            content.append(Paragraph("No characters matched this thesis.", custom_style))
-
-        content.append(Spacer(1, 30))
-
     # Coverage summary
     content.append(Spacer(1, 20))
     summary_text = (
@@ -798,7 +1069,7 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
 
     # Compact appendix: out-of-scope index
     content.append(Spacer(1, 12))
-    content.append(Paragraph(f"Appendix: Latin repertoire not canonically decomposable to ASCII base (+ combining) ({len(out_of_scope_index)})", heading2_style))
+    content.append(Paragraph(f"Appendix: Out of scope under the current thesis ({len(out_of_scope_index)})", heading2_style))
 
     appendix_data = [["Glyph", "Code point", "Name"]]
     for ch, cp, name in out_of_scope_index:
@@ -830,7 +1101,10 @@ def generate_pdf_report(results_tuple, sequences_ascii_base, out_of_scope_index,
 def main():
     """Main execution function."""
     try:
-        enabled_thesis_flags = parse_cli_args(sys.argv)
+        cli_options = parse_cli_args(sys.argv)
+        enabled_thesis_flags = cli_options['enabled_thesis_flags']
+        json_output = cli_options['json_output']
+        json_only = cli_options['json_only']
 
         # Step 1: Parse normative XML (Latin RZ-LGR) — authoritative repertoire
         latin_points, latin_sequences, blocked_variants = parse_lgr_xml(XML_URL)
@@ -851,9 +1125,16 @@ def main():
 
         # Collect requested thesis sections
         thesis_sections = collect_requested_thesis_sections(conn, enabled_thesis_flags, blocked_variants)
+        web_thesis_sections = collect_requested_thesis_sections(conn, list(THESIS_FLAGS.keys()), blocked_variants)
+        web_thesis_sections_by_flag = {
+            section['flag']: section
+            for section in web_thesis_sections
+        }
 
-        # Build out-of-scope index and coverage counts
-        out_of_scope_index, base_counts = get_out_of_scope_from_db(conn)
+        # Build out-of-scope index and coverage counts for the currently enabled thesis flags
+        current_scope_snapshot = build_scope_snapshot(conn, thesis_sections)
+        out_of_scope_index = current_scope_snapshot['out_of_scope_index']
+        base_counts = current_scope_snapshot['coverage_counts']
         coverage_summary = {
             'total_points': base_counts.get('total_points', 0),
             'in_scope': base_counts.get('in_scope', 0),
@@ -871,18 +1152,31 @@ def main():
                 f"Added thesis section {thesis_section['flag']} "
                 f"with {len(thesis_section['entries'])} characters"
             )
+
+        if json_output:
+            payload = build_web_report_payload(
+                conn,
+                results_tuple,
+                sequences_ascii_base,
+                latin_sequences,
+                web_thesis_sections_by_flag,
+            )
+            json_path = write_web_json_report(json_output, payload)
+            print(f"Web JSON data saved to: {json_path}")
         
-        # Step 5: Generate PDF report
-        pdf_path = generate_pdf_report(
-            results_tuple,
-            sequences_ascii_base,
-            out_of_scope_index,
-            coverage_summary,
-            PDF_OUTPUT,
-            thesis_sections=thesis_sections,
-        )
-        
-        print(f"Analysis complete! PDF report saved to: {pdf_path}")
+        if not json_only:
+            # Step 5: Generate PDF report
+            pdf_path = generate_pdf_report(
+                results_tuple,
+                sequences_ascii_base,
+                out_of_scope_index,
+                coverage_summary,
+                PDF_OUTPUT,
+                thesis_sections=thesis_sections,
+            )
+            print(f"Analysis complete! PDF report saved to: {pdf_path}")
+        elif json_output:
+            print("Analysis complete! JSON-only mode finished successfully.")
         
     except Exception as e:
         print(f"Error: {e}")
